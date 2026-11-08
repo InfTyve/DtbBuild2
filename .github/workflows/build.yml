@@ -90,12 +90,35 @@ jobs:
           print(f'[mtk_idle_profile.c] retargeted {fixed} macro line(s) -> {var}')
           PY
           # 原厂配置从通用 defconfig 继承了整套 virtio 虚拟机驱动（QEMU/KVM 用）。
-          # 真机上无用，且 drivers/gpu/drm/virtio/virtgpu_vq.c:929 在 4.19.325 上
+          # 真机上用不到，且 drivers/gpu/drm/virtio/virtgpu_vq.c:929 在 4.19.325 上
           # 报 "use of undeclared identifier 'nents'"，直接中断 drivers 编译。
-          for opt in DRM_VIRTIO_GPU VIRTIO VIRTIO_MENU VIRTIO_BLK VIRTIO_NET VIRTIO_CONSOLE VIRTIO_INPUT VIRTIO_MMIO VIRTIO_MMIO_CMDLINE_DEVICES VIRTIO_VSOCKETS VIRTIO_VSOCKETS_COMMON; do
+          # 注意 CONFIG_VIRTIO 本身不能关：MTK 的 geniezone/trusty（TEE）用 virtio ring
+          # 做安全世界通信，trusty-ipc.c / trusty-virtio.o 会引用 register_virtio_driver、
+          # virtqueue_* 等，关掉后链接期 14 个 undefined reference。
+          # 只关 DRM_VIRTIO_GPU（出问题的那个文件）和其余虚拟机外设。
+          for opt in DRM_VIRTIO_GPU VIRTIO_MENU VIRTIO_BLK VIRTIO_NET VIRTIO_CONSOLE VIRTIO_INPUT VIRTIO_MMIO VIRTIO_MMIO_CMDLINE_DEVICES VIRTIO_VSOCKETS VIRTIO_VSOCKETS_COMMON; do
             sed -i "s/^CONFIG_${opt}=y/# CONFIG_${opt} is not set/" "$GITHUB_WORKSPACE/configs/ekvator.config"
           done
-          echo "virtio remaining: $(grep -cE '^CONFIG_(DRM_VIRTIO|VIRTIO)' "$GITHUB_WORKSPACE/configs/ekvator.config" || true)"
+          sed -i -e 's|^# CONFIG_VIRTIO is not set|CONFIG_VIRTIO=y|' \
+                 -e 's|^# CONFIG_VIRTIO_MENU is not set|CONFIG_VIRTIO_MENU=y|' \
+                 "$GITHUB_WORKSPACE/configs/ekvator.config"
+          echo "virtio remaining: $(grep -E '^CONFIG_VIRTIO=|^CONFIG_VIRTIO_MENU|^CONFIG_DRM_VIRTIO|^CONFIG_VIRTIO_(MMIO|BLK|NET)' "$GITHUB_WORKSPACE/configs/ekvator.config" | tr '\n' ' ')"
+          # connectivity/common/Makefile 里 wmt_drv 是 obj-y 还是 obj-m 取决于
+          # CONFIG_WLAN_DRV_BUILD_IN：
+          #   ifeq ($(CONFIG_WLAN_DRV_BUILD_IN),y) obj-y += wmt_drv.o else obj-m += wmt_drv.o
+          # 原厂配置没有这一项（老内核的树里这个 Kconfig 还不存在），于是 wmt_drv 走了
+          # obj-m，而 make Image 不构建模块——整个 WMT/STP 层（wmt_lib/stp_core/wmt_func
+          # /mtk_wcn_consys_hw）一个 .o 都没有，GPS、FM 里对 mtk_wcn_* / mtk_wmt_* /
+          # gConEmiPhyBase 的引用全部变成 undefined reference。
+          # 本树 Kconfig 里确实有 WLAN_DRV_BUILD_IN（"Build Wlan module in kernel"），打开即可。
+          sed -i 's|^CONFIG_WLAN=y|CONFIG_WLAN=y\nCONFIG_WLAN_DRV_BUILD_IN=y|' "$GITHUB_WORKSPACE/configs/ekvator.config"
+          grep -q '^CONFIG_WLAN_DRV_BUILD_IN=y' "$GITHUB_WORKSPACE/configs/ekvator.config" || echo 'CONFIG_WLAN_DRV_BUILD_IN=y' >> "$GITHUB_WORKSPACE/configs/ekvator.config"
+          echo "wlan build-in: $(grep -E '^CONFIG_WLAN_DRV_BUILD_IN' "$GITHUB_WORKSPACE/configs/ekvator.config")"
+          # fpsgo_v3 的 fpsgo_main.c 会写全局函数指针 cpufreq_notifier_fp，
+          # 该符号在本树里没有定义（原厂 4.19.127 的 mtk_cpufreq 提供），链接报 undefined。
+          # FPSGO 是游戏帧率调度器，纯性能调优，关掉不影响功能与启动。
+          sed -i 's|^CONFIG_MTK_FPSGO_V3=y|# CONFIG_MTK_FPSGO_V3 is not set|' "$GITHUB_WORKSPACE/configs/ekvator.config"
+          echo "fpsgo: $(grep -E 'CONFIG_MTK_FPSGO_V3' "$GITHUB_WORKSPACE/configs/ekvator.config")"
           # imgsensor 的 Makefile 把 CONFIG_CUSTOM_KERNEL_IMGSENSOR 里的每一项当目录名用
           # （FILTER_DRV + wildcard），目录不存在也会照样 obj-y += 进去，最终报
           # No rule to make target '.../imgsensor/src/common/v1/ov8858_mipi_raw/'。
@@ -125,6 +148,74 @@ jobs:
           sed -i 's/^CONFIG_LTO_CLANG=y/# CONFIG_LTO_CLANG is not set/' "$GITHUB_WORKSPACE/configs/ekvator.config"
           sed -i 's/^CONFIG_POLLY_CLANG=y/# CONFIG_POLLY_CLANG is not set/' "$GITHUB_WORKSPACE/configs/ekvator.config"
 
+      - name: Patch link-stage gaps
+        run: |
+          cd kernel
+          python3 - <<'PY'
+          import re, os, sys
+
+          def rd(p):
+              return open(p, encoding='utf-8', errors='replace').read()
+
+          def wr(p, s):
+              open(p, 'w', encoding='utf-8').write(s)
+
+          # 1) drivers/gpu/drm/ttm/ttm_bo_vm.c 是从 5.x 回移的，用了 5.0 才有的
+          #    fault_flag_allow_retry_first()，但本树 include/linux/mm.h 里没有这个
+          #    内联函数，链接期报 undefined reference。语义等价展开，不依赖头文件。
+          p = 'drivers/gpu/drm/ttm/ttm_bo_vm.c'
+          s = rd(p)
+          n = s.count('fault_flag_allow_retry_first(vmf->flags)')
+          s = s.replace('fault_flag_allow_retry_first(vmf->flags)',
+                        '((vmf->flags & FAULT_FLAG_ALLOW_RETRY) && !(vmf->flags & FAULT_FLAG_TRIED))')
+          wr(p, s)
+          print(f'[ttm_bo_vm.c] expanded {n} fault_flag_allow_retry_first()')
+
+          # 2) videox/disp_recovery.c 里 esd_resume(0/1) 是 longcheer 为 NVT nt36525b
+          #    加的触摸屏联动，函数定义在触摸驱动里，本树没有。调用点本身还有
+          #    strnstr(mtkfb_lcm_name,"nt36525b") 保护，跟我们这台的实际意义为零。
+          #    直接注掉调用，保留声明与分支结构。
+          p = 'drivers/misc/mediatek/video/mt6765/videox/disp_recovery.c'
+          lines = rd(p).split('\n')
+          n = 0
+          for i, l in enumerate(lines):
+              if re.match(r'^\s*esd_resume\s*\(\s*[01]\s*\)\s*;\s*$', l):
+                  lines[i] = '/* ekvator: symbol absent in this tree */ /* ' + l.strip() + ' */'
+                  n += 1
+          wr(p, '\n'.join(lines))
+          print(f'[disp_recovery.c] commented out {n} esd_resume() call(s)')
+
+          # 3) eem_v2/mt6765/mtk_picachu.c 的 picachu_apply_efuse_to_eem() 调用
+          #    eem_set_pi_efuse()，其实现（老树在 eem_v2/common/mtk_eem_main.c）
+          #    在本树里不存在。去掉这一句等于跳过把 efuse 里的 PI 校准值写回 EEM，
+          #    EEM 仍按自身流程读 efuse，只损失几个 mV 的余量。
+          p = 'drivers/misc/mediatek/base/power/eem_v2/mt6765/mtk_picachu.c'
+          lines = rd(p).split('\n')
+          n = 0
+          for i, l in enumerate(lines):
+              t = l.strip()
+              if 'eem_set_pi_efuse(' in t and t.endswith(';') and not t.startswith(('extern', '#')):
+                  lines[i] = '/* ekvator: provider missing in this tree */ /* ' + t + ' */'
+                  n += 1
+          wr(p, '\n'.join(lines))
+          print(f'[mtk_picachu.c] commented out {n} eem_set_pi_efuse() call(s)')
+
+          # 4) mmp/src/mmprofile.c 用 trace_printk() 输出，展开会调用
+          #    __trace_printk_check_format()；本树的 kernel/trace 没有导出它，
+          #    链接期 4 处 undefined。补一个弱定义（仅做格式校验，返回 0 即禁用校验），
+          #    mmprofile 功能本身不受影响。
+          p = 'drivers/misc/mediatek/mmp/src/mmprofile.c'
+          s = rd(p)
+          if '__trace_printk_check_format' not in s:
+              s += ('\n\n/* ekvator: 本树 kernel/trace 未提供该符号，补弱定义 */\n'
+                    '__attribute__((weak)) int __trace_printk_check_format(const char *fmt, ...)\n'
+                    '{\n\treturn 0;\n}\n')
+              wr(p, s)
+              print('[mmprofile.c] appended weak __trace_printk_check_format()')
+          else:
+              print('[mmprofile.c] stub already present, skipped')
+          PY
+
       - name: Setup config
         run: |
           cd kernel
@@ -137,7 +228,7 @@ jobs:
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             olddefconfig > /tmp/olddef.log 2>&1 || { tail -40 /tmp/olddef.log; exit 1; }
           echo "=== 生效后的关键项 ==="
-          grep -E 'CONFIG_CUSTOM_KERNEL_LCM|CONFIG_LCM_(WIDTH|HEIGHT)|CONFIG_MTK_PLATFORM|CONFIG_MACH_MT|CONFIG_BATTERY_MT63|CONFIG_SND_SOC_MT63|CONFIG_CC_IS_CLANG|CONFIG_LD_IS_|CONFIG_MTK_LCM_PHYSICAL_ROTATION|CONFIG_VIRTIO|CONFIG_DRM_VIRTIO' out/.config || true
+          grep -E 'CONFIG_CUSTOM_KERNEL_LCM|CONFIG_LCM_(WIDTH|HEIGHT)|CONFIG_MTK_PLATFORM|CONFIG_MACH_MT|CONFIG_BATTERY_MT63|CONFIG_SND_SOC_MT63|CONFIG_CC_IS_CLANG|CONFIG_LD_IS_|CONFIG_MTK_LCM_PHYSICAL_ROTATION|CONFIG_VIRTIO|CONFIG_DRM_VIRTIO|CONFIG_WLAN_DRV_BUILD_IN|CONFIG_MTK_FPSGO_V3' out/.config || true
           echo "=== 行数 ==="
           wc -l out/.config
 
