@@ -103,6 +103,12 @@ jobs:
           # 换成树内实际存在、且作者 blossom_defconfig 验证过的 14 个。
           sed -i 's|^CONFIG_CUSTOM_KERNEL_IMGSENSOR=.*|CONFIG_CUSTOM_KERNEL_IMGSENSOR="hynix_hi1337_i hynix_hi1337_ii hynix_hi1337_iii hynix_hi1337_iiii hynix_hi556_i gc_gc5035_i gc_gc5035_ii gc_gc5035_iii gc_gc5035_iiii hynix_hi259_i hynix_hi259_ii gc_gc02m1_ii hynix_hi259_iii hynix_hi259_iv"|' "$GITHUB_WORKSPACE/configs/ekvator.config"
           echo "imgsensor: $(grep -oE 'CONFIG_CUSTOM_KERNEL_IMGSENSOR=.*' "$GITHUB_WORKSPACE/configs/ekvator.config" | cut -c1-60)..."
+          # fw_log_gps.c 里 #include "connsys_debug_utility.h" 被 #if 0 注释掉，
+          # 而 connectivity/common/Makefile 又把 debug_utility/connsys_debug_utility.o
+          # 的编译条目整段注释掉（第 270-272 行），实现根本不存在。
+          # 光补 include 只会把错误从 fw_log_gps.o 推到 vmlinux 链接阶段，直接关闭该项。
+          sed -i 's|^CONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH=y|# CONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH is not set|' "$GITHUB_WORKSPACE/configs/ekvator.config"
+          echo "connsys log path: $(grep -E 'CONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH' "$GITHUB_WORKSPACE/configs/ekvator.config")"
           # 删掉原厂遗留的链接器类型标记，让 olddefconfig 按实际 LD 重新探测
           sed -i '/^CONFIG_LD_IS_LLD=/d' "$GITHUB_WORKSPACE/configs/ekvator.config"
           sed -i 's/^CONFIG_LTO_CLANG=y/# CONFIG_LTO_CLANG is not set/' "$GITHUB_WORKSPACE/configs/ekvator.config"
