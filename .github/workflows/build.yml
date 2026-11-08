@@ -40,15 +40,22 @@ jobs:
       - name: Patch for clang14
         run: |
           cd kernel
-          # 该树为 LLVM 21 写入了 clang14 不认识的 4 个内联调优参数
-          sed -i '/-ignore-tti-inline-compatible/d' Makefile
-          sed -i '/-inline-instr-cost=8/d' Makefile
-          sed -i '/-inline-call-penalty=8/d' Makefile
-          sed -i '/-inline-enable-cost-benefit-analysis/d' Makefile
-          # 关闭 LTO 与 Polly（AOSP clang 不带 Polly），若原配置未开启则无副作用
+          # 该树的 Makefile 注入了 33 处 -mllvm 调优参数，其中多个是 LLVM 15+ 才有的
+          # （-inline-instr-cost / -inline-call-penalty / -hot-callsite-rel-freq 等）。
+          # clang 14 遇到任何一个都会 fatal: Unknown command line argument。
+          # 这些参数只影响内联激进度，对功能零影响，因此整体移除、保留行结构。
+          python3 - <<'PY'
+          import re
+          s = open('Makefile').read()
+          n = len(re.findall(r'-mllvm\s+[^\s\\]+', s))
+          s = re.sub(r'-mllvm\s+[^\s\\]+', '', s)
+          open('Makefile','w').write(s)
+          print(f'removed {n} -mllvm tokens, remain {len(re.findall(r"-mllvm", s))}')
+          PY
+          # 删掉原厂遗留的链接器类型标记，让 olddefconfig 按实际 LD 重新探测
+          sed -i '/^CONFIG_LD_IS_LLD=/d' "$GITHUB_WORKSPACE/configs/ekvator.config"
           sed -i 's/^CONFIG_LTO_CLANG=y/# CONFIG_LTO_CLANG is not set/' "$GITHUB_WORKSPACE/configs/ekvator.config"
           sed -i 's/^CONFIG_POLLY_CLANG=y/# CONFIG_POLLY_CLANG is not set/' "$GITHUB_WORKSPACE/configs/ekvator.config"
-          echo "remain -mllvm: $(grep -c -- -mllvm Makefile || true)"
 
       - name: Setup config
         run: |
@@ -62,12 +69,13 @@ jobs:
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             olddefconfig > /tmp/olddef.log 2>&1 || { tail -40 /tmp/olddef.log; exit 1; }
           echo "=== 生效后的关键项 ==="
-          grep -E 'CONFIG_CUSTOM_KERNEL_LCM|CONFIG_LCM_(WIDTH|HEIGHT)|CONFIG_MTK_PLATFORM|CONFIG_MACH_MT|CONFIG_BATTERY_MT6359|CONFIG_SND_SOC_MT6359_ACCDET|CONFIG_CC_IS_CLANG|CONFIG_MTK_LCM_PHYSICAL_ROTATION' out/.config || true
-          echo "=== 配置总行数 ==="
+          grep -E 'CONFIG_CUSTOM_KERNEL_LCM|CONFIG_LCM_(WIDTH|HEIGHT)|CONFIG_MTK_PLATFORM|CONFIG_MACH_MT|CONFIG_BATTERY_MT6359|CONFIG_SND_SOC_MT6359_ACCDET|CONFIG_CC_IS_CLANG|CONFIG_LD_IS_|CONFIG_MTK_LCM_PHYSICAL_ROTATION' out/.config || true
+          echo "=== 行数 ==="
           wc -l out/.config
 
       - name: Build Image
         run: |
+          set -o pipefail
           cd kernel
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
           export CCACHE_DIR="$HOME/.ccache"
@@ -79,7 +87,16 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             KCFLAGS="-Wno-error" \
-            -j"$(nproc)" Image
+            -j"$(nproc)" Image 2>&1 | tee "$GITHUB_WORKSPACE/build.log" || {
+              rc=$?
+              {
+                echo '## Build failed'
+                echo '```'
+                grep -nE "error:|fatal error|Error [0-9]+|No rule to make target|Unknown command line" "$GITHUB_WORKSPACE/build.log" | tail -50
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit $rc
+            }
           ls -l out/arch/arm64/boot/Image
           ccache -s || true
 
@@ -119,7 +136,16 @@ jobs:
           print('OK: boot.img 结构校验通过')
           PY
 
-      - name: Upload
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload boot image
         uses: actions/upload-artifact@v4
         with:
           name: boot-image
