@@ -52,6 +52,13 @@ jobs:
           open('Makefile','w').write(s)
           print(f'removed {n} -mllvm tokens, remain {len(re.findall(r"-mllvm", s))}')
           PY
+          # 原厂配置从通用 defconfig 继承了整套 virtio 虚拟机驱动（QEMU/KVM 用）。
+          # 真机上无用，且 drivers/gpu/drm/virtio/virtgpu_vq.c:929 在 4.19.325 上
+          # 报 "use of undeclared identifier 'nents'"，直接中断 drivers 编译。
+          for opt in DRM_VIRTIO_GPU VIRTIO VIRTIO_MENU VIRTIO_BLK VIRTIO_NET VIRTIO_CONSOLE VIRTIO_INPUT VIRTIO_MMIO VIRTIO_MMIO_CMDLINE_DEVICES VIRTIO_VSOCKETS VIRTIO_VSOCKETS_COMMON; do
+            sed -i "s/^CONFIG_${opt}=y/# CONFIG_${opt} is not set/" "$GITHUB_WORKSPACE/configs/ekvator.config"
+          done
+          echo "virtio remaining: $(grep -cE '^CONFIG_(DRM_VIRTIO|VIRTIO)' "$GITHUB_WORKSPACE/configs/ekvator.config" || true)"
           # 删掉原厂遗留的链接器类型标记，让 olddefconfig 按实际 LD 重新探测
           sed -i '/^CONFIG_LD_IS_LLD=/d' "$GITHUB_WORKSPACE/configs/ekvator.config"
           sed -i 's/^CONFIG_LTO_CLANG=y/# CONFIG_LTO_CLANG is not set/' "$GITHUB_WORKSPACE/configs/ekvator.config"
@@ -69,7 +76,7 @@ jobs:
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             olddefconfig > /tmp/olddef.log 2>&1 || { tail -40 /tmp/olddef.log; exit 1; }
           echo "=== 生效后的关键项 ==="
-          grep -E 'CONFIG_CUSTOM_KERNEL_LCM|CONFIG_LCM_(WIDTH|HEIGHT)|CONFIG_MTK_PLATFORM|CONFIG_MACH_MT|CONFIG_BATTERY_MT6359|CONFIG_SND_SOC_MT6359_ACCDET|CONFIG_CC_IS_CLANG|CONFIG_LD_IS_|CONFIG_MTK_LCM_PHYSICAL_ROTATION' out/.config || true
+          grep -E 'CONFIG_CUSTOM_KERNEL_LCM|CONFIG_LCM_(WIDTH|HEIGHT)|CONFIG_MTK_PLATFORM|CONFIG_MACH_MT|CONFIG_BATTERY_MT6359|CONFIG_SND_SOC_MT6359_ACCDET|CONFIG_CC_IS_CLANG|CONFIG_LD_IS_|CONFIG_MTK_LCM_PHYSICAL_ROTATION|CONFIG_VIRTIO|CONFIG_DRM_VIRTIO' out/.config || true
           echo "=== 行数 ==="
           wc -l out/.config
 
