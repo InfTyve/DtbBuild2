@@ -40,17 +40,33 @@ jobs:
       - name: Patch for clang14
         run: |
           cd kernel
-          # 该树的 Makefile 注入了 33 处 -mllvm 调优参数，其中多个是 LLVM 15+ 才有的
-          # （-inline-instr-cost / -inline-call-penalty / -hot-callsite-rel-freq 等）。
-          # clang 14 遇到任何一个都会 fatal: Unknown command line argument。
-          # 这些参数只影响内联激进度，对功能零影响，因此整体移除、保留行结构。
           python3 - <<'PY'
           import re
+
+          # 1) 该树的 Makefile 注入了 33 处 -mllvm 调优参数，其中多个是 LLVM 15+ 才有的
+          #    （-inline-instr-cost / -inline-call-penalty / -hot-callsite-rel-freq 等）。
+          #    clang 14 遇到任何一个都会 fatal: Unknown command line argument。
+          #    这些参数只影响内联激进度，对功能零影响，整体移除、保留行结构。
           s = open('Makefile').read()
           n = len(re.findall(r'-mllvm\s+[^\s\\]+', s))
           s = re.sub(r'-mllvm\s+[^\s\\]+', '', s)
-          open('Makefile','w').write(s)
-          print(f'removed {n} -mllvm tokens, remain {len(re.findall(r"-mllvm", s))}')
+          open('Makefile', 'w').write(s)
+          print(f'[Makefile] removed {n} -mllvm tokens, remain {len(re.findall(r"-mllvm", s))}')
+
+          # 2) 该树 backport "mipi-dsi: add num_params" 时漏删了旧签名，
+          #    include/drm/drm_mipi_dsi.h:291 会出现孤立的 "u16 *brightness);"，
+          #    编译 drm_mipi_dsi.o 时直接报 extraneous ')' before ';'。
+          p = 'include/drm/drm_mipi_dsi.h'
+          src = open(p).read().split('\n')
+          out, dropped = [], 0
+          for i, l in enumerate(src):
+              if re.match(r'^\s*u16 \*brightness\);\s*$', l) and i > 0 and 'size_t num_params);' in src[i-1]:
+                  dropped += 1
+                  continue
+              out.append(l)
+          if dropped:
+              open(p, 'w').write('\n'.join(out))
+          print(f'[drm_mipi_dsi.h] dropped {dropped} stray line(s), now {len(out)} lines')
           PY
           # 原厂配置从通用 defconfig 继承了整套 virtio 虚拟机驱动（QEMU/KVM 用）。
           # 真机上无用，且 drivers/gpu/drm/virtio/virtgpu_vq.c:929 在 4.19.325 上
