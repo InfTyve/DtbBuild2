@@ -136,6 +136,7 @@ jobs:
           cd kernel
           export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
           export CCACHE_DIR="$HOME/.ccache"
+          LOG="$GITHUB_WORKSPACE/build.log"
           ccache -M 3G > /dev/null || true
           make O=out ARCH=arm64 \
             CC="ccache clang" \
@@ -144,16 +145,31 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             KCFLAGS="-Wno-error" \
-            -j"$(nproc)" Image 2>&1 | tee "$GITHUB_WORKSPACE/build.log" || {
-              rc=$?
-              {
-                echo '## Build failed'
-                echo '```'
-                grep -nE "error:|fatal error|Error [0-9]+|No rule to make target|Unknown command line" "$GITHUB_WORKSPACE/build.log" | tail -50
-                echo '```'
-              } >> "$GITHUB_STEP_SUMMARY"
-              exit $rc
-            }
+            -j"$(nproc)" Image 2>&1 | tee "$LOG"
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ] || [ ! -f out/arch/arm64/boot/Image ]; then
+            {
+              echo
+              echo '================ BUILD FAILED ================'
+              echo '--- [1] 编译错误 ---'
+              grep -nE '(error|fatal error): ' "$LOG" | head -25 || true
+              echo '--- [2] 链接错误 ---'
+              grep -nE 'undefined (symbol|reference)|ld\.lld: error|ld: (error|cannot|unrecognized)' "$LOG" | head -30 || true
+              echo '--- [3] modpost / 符号表 ---'
+              grep -nE '^ERROR: |modpost:' "$LOG" | head -15 || true
+              echo '--- [4] 缺目标 / 不支持的参数 ---'
+              grep -nE 'No rule to make target|Unknown command line argument|is not a valid' "$LOG" | head -15 || true
+              echo '--- [5] 末尾 12 行 ---'
+              tail -12 "$LOG"
+              echo '============== END OF DIGEST ================'
+            } | tee -a "$GITHUB_STEP_SUMMARY"
+            # 同时输出为 GitHub 注解，失败时 run 页面顶部直接列出，手机端不用翻日志
+            grep -nE '(error|fatal error|undefined symbol|No rule to make target)' "$LOG" \
+              | head -10 | tr -d '\r' | cut -c1-300 | while IFS= read -r line; do
+                echo "::error::$line"
+              done
+            exit 1
+          fi
           ls -l out/arch/arm64/boot/Image
           ccache -s || true
 
