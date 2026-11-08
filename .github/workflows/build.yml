@@ -67,6 +67,27 @@ jobs:
           if dropped:
               open(p, 'w').write('\n'.join(out))
           print(f'[drm_mipi_dsi.h] dropped {dropped} stray line(s), now {len(out)} lines')
+
+          # 3) 该树把 mtk_idle_profile.c 的日志缓冲变量 idle_log 重命名为 idle_state_log，
+          #    却漏改 75-77 行三个宏。append_log() 展开后引用不存在的 idle_log，
+          #    从 322 行起连续报 use of undeclared identifier 'idle_log'。
+          #    按实际定义的变量名回填，不写死名字，兼容作者后续再改名。
+          p = 'drivers/misc/mediatek/base/power/spm/common/mtk_idle_profile.c'
+          src = open(p).read()
+          m = re.search(r'static\s+struct\s+mtk_idle_buf\s+(\w+)\s*;', src)
+          var = m.group(1) if m else 'idle_log'
+          lines = src.split('\n')
+          fixed = 0
+          for i, l in enumerate(lines):
+              if l.lstrip().startswith('#define') and 'idle_log' in l \
+                 and re.search(r'\b(reset_log|get_log|append_log)\b', l):
+                  new = re.sub(r'\bidle_log\b', var, l)
+                  if new != l:
+                      lines[i] = new
+                      fixed += 1
+          if fixed:
+              open(p, 'w').write('\n'.join(lines))
+          print(f'[mtk_idle_profile.c] retargeted {fixed} macro line(s) -> {var}')
           PY
           # 原厂配置从通用 defconfig 继承了整套 virtio 虚拟机驱动（QEMU/KVM 用）。
           # 真机上无用，且 drivers/gpu/drm/virtio/virtgpu_vq.c:929 在 4.19.325 上
@@ -75,6 +96,13 @@ jobs:
             sed -i "s/^CONFIG_${opt}=y/# CONFIG_${opt} is not set/" "$GITHUB_WORKSPACE/configs/ekvator.config"
           done
           echo "virtio remaining: $(grep -cE '^CONFIG_(DRM_VIRTIO|VIRTIO)' "$GITHUB_WORKSPACE/configs/ekvator.config" || true)"
+          # imgsensor 的 Makefile 把 CONFIG_CUSTOM_KERNEL_IMGSENSOR 里的每一项当目录名用
+          # （FILTER_DRV + wildcard），目录不存在也会照样 obj-y += 进去，最终报
+          # No rule to make target '.../imgsensor/src/common/v1/ov8858_mipi_raw/'。
+          # 原厂的 5 个 sensor 名（ov8858/gc8034/gc5035/gc5025/gc2385）在本树里一个都没有，
+          # 换成树内实际存在、且作者 blossom_defconfig 验证过的 14 个。
+          sed -i 's|^CONFIG_CUSTOM_KERNEL_IMGSENSOR=.*|CONFIG_CUSTOM_KERNEL_IMGSENSOR="hynix_hi1337_i hynix_hi1337_ii hynix_hi1337_iii hynix_hi1337_iiii hynix_hi556_i gc_gc5035_i gc_gc5035_ii gc_gc5035_iii gc_gc5035_iiii hynix_hi259_i hynix_hi259_ii gc_gc02m1_ii hynix_hi259_iii hynix_hi259_iv"|' "$GITHUB_WORKSPACE/configs/ekvator.config"
+          echo "imgsensor: $(grep -oE 'CONFIG_CUSTOM_KERNEL_IMGSENSOR=.*' "$GITHUB_WORKSPACE/configs/ekvator.config" | cut -c1-60)..."
           # 删掉原厂遗留的链接器类型标记，让 olddefconfig 按实际 LD 重新探测
           sed -i '/^CONFIG_LD_IS_LLD=/d' "$GITHUB_WORKSPACE/configs/ekvator.config"
           sed -i 's/^CONFIG_LTO_CLANG=y/# CONFIG_LTO_CLANG is not set/' "$GITHUB_WORKSPACE/configs/ekvator.config"
