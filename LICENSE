@@ -1,0 +1,8 @@
+GNU General Public License v2.0
+
+本仓库的 scripts/ 与 .github/ 由仓库作者编写，以 GPL-2.0 发布。
+许可证全文：https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt
+
+configs/ekvator.config 提取自设备原厂内核的 IKCONFIG 段。
+prebuilt/dtb 与 prebuilt/ramdisk.gz 来自设备原厂固件，
+版权归原始厂商所有，仅用于该设备的系统构建与恢复。

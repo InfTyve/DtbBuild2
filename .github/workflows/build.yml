@@ -1,0 +1,130 @@
+name: Build Kernel
+on: [workflow_dispatch]
+
+env:
+  KERNEL_REPO: https://github.com/plmzaq2112/dandelion-4.19-purity.git
+  KERNEL_BRANCH: 4.19.325-purity
+  CLANG_REPO: https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost
+          sudo apt-get clean
+          df -h /
+
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc bison flex libssl-dev libelf-dev cpio rsync \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu gcc-arm-linux-gnueabi \
+            device-tree-compiler lz4 zstd ccache python3
+          df -h /
+
+      - name: Clone kernel
+        run: |
+          git clone --depth=1 -b "$KERNEL_BRANCH" "$KERNEL_REPO" kernel
+          cd kernel && git log --oneline -1
+
+      - name: Clone clang
+        run: |
+          git clone --depth=1 "$CLANG_REPO" clang
+          ./clang/bin/clang --version | head -3
+
+      - name: Patch for clang14
+        run: |
+          cd kernel
+          # 该树为 LLVM 21 写入了 clang14 不认识的 4 个内联调优参数
+          sed -i '/-ignore-tti-inline-compatible/d' Makefile
+          sed -i '/-inline-instr-cost=8/d' Makefile
+          sed -i '/-inline-call-penalty=8/d' Makefile
+          sed -i '/-inline-enable-cost-benefit-analysis/d' Makefile
+          # 关闭 LTO 与 Polly（AOSP clang 不带 Polly），若原配置未开启则无副作用
+          sed -i 's/^CONFIG_LTO_CLANG=y/# CONFIG_LTO_CLANG is not set/' "$GITHUB_WORKSPACE/configs/ekvator.config"
+          sed -i 's/^CONFIG_POLLY_CLANG=y/# CONFIG_POLLY_CLANG is not set/' "$GITHUB_WORKSPACE/configs/ekvator.config"
+          echo "remain -mllvm: $(grep -c -- -mllvm Makefile || true)"
+
+      - name: Setup config
+        run: |
+          cd kernel
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          mkdir -p out
+          cp "$GITHUB_WORKSPACE/configs/ekvator.config" out/.config
+          make O=out ARCH=arm64 CC=clang \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            olddefconfig > /tmp/olddef.log 2>&1 || { tail -40 /tmp/olddef.log; exit 1; }
+          echo "=== 生效后的关键项 ==="
+          grep -E 'CONFIG_CUSTOM_KERNEL_LCM|CONFIG_LCM_(WIDTH|HEIGHT)|CONFIG_MTK_PLATFORM|CONFIG_MACH_MT|CONFIG_BATTERY_MT6359|CONFIG_SND_SOC_MT6359_ACCDET|CONFIG_CC_IS_CLANG|CONFIG_MTK_LCM_PHYSICAL_ROTATION' out/.config || true
+          echo "=== 配置总行数 ==="
+          wc -l out/.config
+
+      - name: Build Image
+        run: |
+          cd kernel
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          export CCACHE_DIR="$HOME/.ccache"
+          ccache -M 3G > /dev/null || true
+          make O=out ARCH=arm64 \
+            CC="ccache clang" \
+            LLVM_IAS=0 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+            KCFLAGS="-Wno-error" \
+            -j"$(nproc)" Image
+          ls -l out/arch/arm64/boot/Image
+          ccache -s || true
+
+      - name: Show version
+        run: |
+          strings kernel/out/arch/arm64/boot/Image | grep -m1 'Linux version' || true
+
+      - name: Pack boot.img
+        run: |
+          gzip -9 -n -c kernel/out/arch/arm64/boot/Image > Image.gz
+          ls -l Image.gz
+          python3 scripts/pack_bootimg.py \
+            --kernel Image.gz \
+            --ramdisk prebuilt/ramdisk.gz \
+            --dtb prebuilt/dtb \
+            -o boot.img
+
+      - name: Verify boot.img
+        run: |
+          python3 - <<'PY'
+          import struct
+          d = open('boot.img','rb').read()
+          f = struct.unpack_from('<8s10I', d, 0)
+          magic, ksz, kaddr, rsz, raddr, ssz, saddr, taddr, psz, hv, osv = f
+          # v2 布局: 1632=recovery_dtbo_size, 1636=dtbo_off(8B), 1644=header_size, 1648=dtb_size
+          dtbsz = struct.unpack_from('<I', d, 1648)[0]
+          print(f'magic      : {magic}')
+          print(f'kernel     : {ksz:>10,} bytes  @ {kaddr:#x}')
+          print(f'ramdisk    : {rsz:>10,} bytes  @ {raddr:#x}')
+          print(f'dtb        : {dtbsz:>10,} bytes')
+          print(f'page_size  : {psz}   header_version: {hv}')
+          print(f'total      : {len(d):>10,} bytes  (partition limit 33,554,432)')
+          assert magic == b'ANDROID!', 'bad magic'
+          assert len(d) <= 32*1024*1024, 'exceeds boot partition'
+          assert 1024*1024 < ksz < 32*1024*1024, 'kernel size looks wrong'
+          assert dtbsz == 107563, f'dtb size mismatch: {dtbsz}'
+          print('OK: boot.img 结构校验通过')
+          PY
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-image
+          path: |
+            boot.img
+            Image.gz
+          if-no-files-found: error
+          retention-days: 30
