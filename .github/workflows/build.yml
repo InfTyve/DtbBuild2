@@ -109,6 +109,17 @@ jobs:
           # 光补 include 只会把错误从 fw_log_gps.o 推到 vmlinux 链接阶段，直接关闭该项。
           sed -i 's|^CONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH=y|# CONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH is not set|' "$GITHUB_WORKSPACE/configs/ekvator.config"
           echo "connsys log path: $(grep -E 'CONFIG_MTK_CONNSYS_DEDICATED_LOG_PATH' "$GITHUB_WORKSPACE/configs/ekvator.config")"
+          # MT6357 与 MT6359 是两颗不同 PMIC 的同一套驱动（厂商把源码整套复制，
+          # 函数名、静态变量名都没改）。MT8768/MT6765 用的是 MT6357：
+          #   CONFIG_REGULATOR_MT6357=y / CONFIG_REGULATOR_MT6359 is not set
+          # 原厂把 MT6359 那两个驱动造成模块（=m），模块不参与 vmlinux 链接，所以从不冲突。
+          # 之前把它们改成 =y 后，两个 .o 同时进 vmlinux，链接器报 44 处
+          # "multiple definition of ..."；mt6359-gauge.o 与 mt6357-gauge.o 抢符号。
+          # 正确做法是保留原厂的 =m 语义、且明确只内建本机这一颗。
+          sed -i 's|^CONFIG_BATTERY_MT6359=y|# CONFIG_BATTERY_MT6359 is not set|' "$GITHUB_WORKSPACE/configs/ekvator.config"
+          sed -i 's|^CONFIG_SND_SOC_MT6359_ACCDET=y|# CONFIG_SND_SOC_MT6359_ACCDET is not set|' "$GITHUB_WORKSPACE/configs/ekvator.config"
+          echo "gauge: $(grep -E 'CONFIG_BATTERY_MT63' "$GITHUB_WORKSPACE/configs/ekvator.config" | tr '\n' ' ')"
+          echo "accdet: $(grep -E 'CONFIG_SND_SOC_MT63.*ACCDET' "$GITHUB_WORKSPACE/configs/ekvator.config" | tr '\n' ' ')"
           # 删掉原厂遗留的链接器类型标记，让 olddefconfig 按实际 LD 重新探测
           sed -i '/^CONFIG_LD_IS_LLD=/d' "$GITHUB_WORKSPACE/configs/ekvator.config"
           sed -i 's/^CONFIG_LTO_CLANG=y/# CONFIG_LTO_CLANG is not set/' "$GITHUB_WORKSPACE/configs/ekvator.config"
@@ -126,7 +137,7 @@ jobs:
             CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
             olddefconfig > /tmp/olddef.log 2>&1 || { tail -40 /tmp/olddef.log; exit 1; }
           echo "=== 生效后的关键项 ==="
-          grep -E 'CONFIG_CUSTOM_KERNEL_LCM|CONFIG_LCM_(WIDTH|HEIGHT)|CONFIG_MTK_PLATFORM|CONFIG_MACH_MT|CONFIG_BATTERY_MT6359|CONFIG_SND_SOC_MT6359_ACCDET|CONFIG_CC_IS_CLANG|CONFIG_LD_IS_|CONFIG_MTK_LCM_PHYSICAL_ROTATION|CONFIG_VIRTIO|CONFIG_DRM_VIRTIO' out/.config || true
+          grep -E 'CONFIG_CUSTOM_KERNEL_LCM|CONFIG_LCM_(WIDTH|HEIGHT)|CONFIG_MTK_PLATFORM|CONFIG_MACH_MT|CONFIG_BATTERY_MT63|CONFIG_SND_SOC_MT63|CONFIG_CC_IS_CLANG|CONFIG_LD_IS_|CONFIG_MTK_LCM_PHYSICAL_ROTATION|CONFIG_VIRTIO|CONFIG_DRM_VIRTIO' out/.config || true
           echo "=== 行数 ==="
           wc -l out/.config
 
@@ -154,7 +165,7 @@ jobs:
               echo '--- [1] 编译错误 ---'
               grep -nE '(error|fatal error): ' "$LOG" | head -25 || true
               echo '--- [2] 链接错误 ---'
-              grep -nE 'undefined (symbol|reference)|ld\.lld: error|ld: (error|cannot|unrecognized)' "$LOG" | head -30 || true
+              grep -nE 'undefined (symbol|reference)|multiple definition of|ld\.lld: error|ld: (error|cannot|unrecognized)' "$LOG" | head -30 || true
               echo '--- [3] modpost / 符号表 ---'
               grep -nE '^ERROR: |modpost:' "$LOG" | head -15 || true
               echo '--- [4] 缺目标 / 不支持的参数 ---'
